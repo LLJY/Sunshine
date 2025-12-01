@@ -112,9 +112,6 @@ namespace portal {
       if (create_session(loop, session_path, session_token) < 0) {
         return -1;
       }
-      if (select_remote_desktop_devices(loop, session_path) < 0) {
-        return -1;
-      }
       if (select_screencast_sources(loop, session_path) < 0) {
         return -1;
       }
@@ -154,7 +151,8 @@ namespace portal {
       g_variant_builder_close(&builder);
 
       g_autoptr(GError) err = NULL;
-      g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(remote_desktop_proxy, "CreateSession", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
+      // Use ScreenCast.CreateSession for better portal compatibility (KDE portal doesn't support combined RemoteDesktop+ScreenCast sessions)
+      g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(screencast_proxy, "CreateSession", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
 
       if (err) {
         BOOST_LOG(error) << "Could not create session: "sv << err->message;
@@ -242,7 +240,8 @@ namespace portal {
       g_variant_builder_close(&builder);
 
       g_autoptr(GError) err = NULL;
-      g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(remote_desktop_proxy, "Start", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
+      // Use ScreenCast.Start for ScreenCast-only sessions
+      g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(screencast_proxy, "Start", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
       if (err) {
         BOOST_LOG(error) << "Could not start session: "sv << err->message;
         return -1;

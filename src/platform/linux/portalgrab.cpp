@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <fcntl.h>
+#include <fstream>
 #include <string.h>
 #include <thread>
 
@@ -50,6 +51,35 @@ using namespace std::literals;
 
 namespace portal {
   static char *restore_token;
+
+  static std::string get_token_file_path() {
+    const char *config_dir = g_get_user_config_dir();
+    return std::string(config_dir) + "/sunshine/portal_restore_token";
+  }
+
+  static void load_restore_token() {
+    if (restore_token) return;  // Already loaded
+
+    std::ifstream file(get_token_file_path());
+    if (file.good()) {
+      std::string token;
+      std::getline(file, token);
+      if (!token.empty()) {
+        restore_token = g_strdup(token.c_str());
+        BOOST_LOG(info) << "Loaded portal restore token from file"sv;
+      }
+    }
+  }
+
+  static void save_restore_token() {
+    if (!restore_token) return;
+
+    std::ofstream file(get_token_file_path());
+    if (file.good()) {
+      file << restore_token;
+      BOOST_LOG(info) << "Saved portal restore token to file"sv;
+    }
+  }
 
   struct format_map_t {
     uint64_t fourcc;
@@ -106,6 +136,9 @@ namespace portal {
     }
 
     int connect_to_portal() {
+      // Load any previously saved restore token
+      load_restore_token();
+
       g_autoptr(GMainLoop) loop = g_main_loop_new(NULL, FALSE);
       g_autofree gchar *session_path = NULL, *session_token = NULL;
       create_session_path(conn, &session_path, &session_token);
@@ -256,9 +289,13 @@ namespace portal {
       g_autoptr(GVariant) dict = NULL, streams = NULL;
       g_variant_get(start_response, "(u@a{sv})", NULL, &dict, NULL);
       streams = g_variant_lookup_value(dict, "streams", G_VARIANT_TYPE("a(ua{sv})"));
-      // Preserve restore token for multiple runs (e.g. probing)
-      if (!restore_token) {
-        g_variant_lookup(dict, "restore_token", "s", &restore_token, NULL);
+      // Get restore token and save it for future sessions
+      char *new_token = NULL;
+      g_variant_lookup(dict, "restore_token", "s", &new_token, NULL);
+      if (new_token) {
+        if (restore_token) g_free(restore_token);
+        restore_token = new_token;
+        save_restore_token();
       }
 
       GVariantIter iter;

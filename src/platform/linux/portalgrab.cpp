@@ -35,6 +35,7 @@
 
 #define PERSIST_FORGET 0
 #define PERSIST_WHILE_RUNNING 1
+#define PERSIST_PERSISTENT 2
 
 #define PORTAL_NAME "org.freedesktop.portal.Desktop"
 #define PORTAL_PATH "/org/freedesktop/portal/desktop"
@@ -209,7 +210,10 @@ namespace portal {
       g_variant_builder_add(&builder, "{sv}", "handle_token", g_variant_new_string(request_token));
       g_variant_builder_add(&builder, "{sv}", "types", g_variant_new_uint32(SOURCE_TYPE_MONITOR));
       g_variant_builder_add(&builder, "{sv}", "cursor_mode", g_variant_new_uint32(CURSOR_MODE_EMBEDDED));
-      g_variant_builder_add(&builder, "{sv}", "persist_mode", g_variant_new_uint32(PERSIST_FORGET));
+      g_variant_builder_add(&builder, "{sv}", "persist_mode", g_variant_new_uint32(PERSIST_PERSISTENT));
+      if (restore_token) {
+        g_variant_builder_add(&builder, "{sv}", "restore_token", g_variant_new_string(restore_token));
+      }
       g_variant_builder_close(&builder);
 
       g_autoptr(GError) err = NULL;

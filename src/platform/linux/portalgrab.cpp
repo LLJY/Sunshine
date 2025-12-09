@@ -3,8 +3,11 @@
  * @brief Definitions for XDG portal grab.
  */
 // standard includes
+#include <atomic>
 #include <fcntl.h>
+#include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string.h>
 #include <thread>
 
@@ -50,7 +53,9 @@
 using namespace std::literals;
 
 namespace portal {
-  static char *restore_token;
+  // Thread-safe token management
+  static std::mutex token_mutex;
+  static char *restore_token = nullptr;
 
   static std::string get_token_file_path() {
     const char *config_dir = g_get_user_config_dir();
@@ -58,26 +63,80 @@ namespace portal {
   }
 
   static void load_restore_token() {
+    std::lock_guard<std::mutex> lock(token_mutex);
+
     if (restore_token) return;  // Already loaded
 
-    std::ifstream file(get_token_file_path());
-    if (file.good()) {
-      std::string token;
-      std::getline(file, token);
-      if (!token.empty()) {
-        restore_token = g_strdup(token.c_str());
-        BOOST_LOG(info) << "Loaded portal restore token from file"sv;
-      }
+    auto path = get_token_file_path();
+    std::ifstream file(path);
+    if (!file) {
+      BOOST_LOG(debug) << "No portal restore token file found at: "sv << path;
+      return;
     }
+
+    std::string token;
+    if (!std::getline(file, token)) {
+      BOOST_LOG(warning) << "Failed to read portal restore token from file"sv;
+      return;
+    }
+
+    if (token.empty()) {
+      BOOST_LOG(debug) << "Portal restore token file is empty"sv;
+      return;
+    }
+
+    restore_token = g_strdup(token.c_str());
+    BOOST_LOG(info) << "Loaded portal restore token from file"sv;
   }
 
   static void save_restore_token() {
+    std::lock_guard<std::mutex> lock(token_mutex);
+
     if (!restore_token) return;
 
-    std::ofstream file(get_token_file_path());
-    if (file.good()) {
-      file << restore_token;
-      BOOST_LOG(info) << "Saved portal restore token to file"sv;
+    auto path = get_token_file_path();
+
+    // Ensure parent directory exists
+    std::error_code ec;
+    auto dir = std::filesystem::path(path).parent_path();
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+      BOOST_LOG(error) << "Failed to create token directory "sv << dir << ": "sv << ec.message();
+      return;
+    }
+
+    // Atomic write via temp file
+    auto temp_path = path + ".tmp";
+    std::ofstream file(temp_path, std::ios::trunc);
+    if (!file) {
+      BOOST_LOG(error) << "Failed to open token file for writing: "sv << temp_path;
+      return;
+    }
+
+    file << restore_token;
+    file.close();
+
+    if (!file) {
+      BOOST_LOG(error) << "Failed to write portal restore token to file"sv;
+      std::filesystem::remove(temp_path, ec);
+      return;
+    }
+
+    std::filesystem::rename(temp_path, path, ec);
+    if (ec) {
+      BOOST_LOG(error) << "Failed to finalize token file: "sv << ec.message();
+      std::filesystem::remove(temp_path, ec);
+      return;
+    }
+
+    BOOST_LOG(info) << "Saved portal restore token to file"sv;
+  }
+
+  static void cleanup_restore_token() {
+    std::lock_guard<std::mutex> lock(token_mutex);
+    if (restore_token) {
+      g_free(restore_token);
+      restore_token = nullptr;
     }
   }
 
@@ -113,27 +172,36 @@ namespace portal {
   class dbus_t {
   public:
     ~dbus_t() {
-      g_object_unref(screencast_proxy);
-      g_object_unref(remote_desktop_proxy);
-      g_object_unref(conn);
+      // Cleanup token on dbus destruction
+      cleanup_restore_token();
+
+      if (screencast_proxy) g_object_unref(screencast_proxy);
+      if (remote_desktop_proxy) g_object_unref(remote_desktop_proxy);
+      if (conn) g_object_unref(conn);
     }
 
     int init() {
       conn = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
       if (!conn) {
+        BOOST_LOG(error) << "Failed to connect to D-Bus session bus"sv;
         return -1;
       }
       remote_desktop_proxy = g_dbus_proxy_new_sync(conn, G_DBUS_PROXY_FLAGS_NONE, NULL, PORTAL_NAME, PORTAL_PATH, REMOTE_DESKTOP_IFACE, NULL, NULL);
       if (!remote_desktop_proxy) {
+        BOOST_LOG(error) << "Failed to create RemoteDesktop proxy"sv;
         return -1;
       }
       screencast_proxy = g_dbus_proxy_new_sync(conn, G_DBUS_PROXY_FLAGS_NONE, NULL, PORTAL_NAME, PORTAL_PATH, SCREENCAST_IFACE, NULL, NULL);
       if (!screencast_proxy) {
+        BOOST_LOG(error) << "Failed to create ScreenCast proxy"sv;
         return -1;
       }
 
       return 0;
     }
+
+    // Set to false to skip combined RemoteDesktop+ScreenCast attempt (faster startup on KDE)
+    static constexpr bool TRY_COMBINED_MODE = true;
 
     int connect_to_portal() {
       // Load any previously saved restore token
@@ -141,15 +209,53 @@ namespace portal {
 
       g_autoptr(GMainLoop) loop = g_main_loop_new(NULL, FALSE);
       g_autofree gchar *session_path = NULL, *session_token = NULL;
-      create_session_path(conn, &session_path, &session_token);
 
-      if (create_session(loop, session_path, session_token) < 0) {
-        return -1;
+      bool use_screencast_only = !TRY_COMBINED_MODE;
+
+      // Try RemoteDesktop+ScreenCast combined mode first (full functionality on GNOME/wlr)
+      if (TRY_COMBINED_MODE) {
+        create_session_path(conn, &session_path, &session_token);
+
+        if (create_session(loop, session_path, session_token, /*use_remote_desktop=*/true) == 0) {
+          if (select_remote_desktop_devices(loop, session_path) == 0) {
+            if (select_screencast_sources(loop, session_path) == 0) {
+              // Combined mode succeeded
+              BOOST_LOG(info) << "Using RemoteDesktop+ScreenCast combined mode"sv;
+            } else {
+              // KDE portal typically fails here with "Invalid session"
+              BOOST_LOG(warning) << "Combined mode failed at SelectSources, falling back to ScreenCast-only"sv;
+              use_screencast_only = true;
+            }
+          } else {
+            BOOST_LOG(warning) << "Combined mode failed at SelectDevices, falling back to ScreenCast-only"sv;
+            use_screencast_only = true;
+          }
+        } else {
+          BOOST_LOG(warning) << "Combined mode failed at CreateSession, falling back to ScreenCast-only"sv;
+          use_screencast_only = true;
+        }
       }
-      if (select_screencast_sources(loop, session_path) < 0) {
-        return -1;
+
+      // Fallback to ScreenCast-only mode (KDE compatible)
+      if (use_screencast_only) {
+        // Need to create a new session for ScreenCast-only
+        g_free(session_path);
+        g_free(session_token);
+        session_path = NULL;
+        session_token = NULL;
+        create_session_path(conn, &session_path, &session_token);
+
+        if (create_session(loop, session_path, session_token, /*use_remote_desktop=*/false) < 0) {
+          BOOST_LOG(error) << "ScreenCast-only mode also failed"sv;
+          return -1;
+        }
+        if (select_screencast_sources(loop, session_path) < 0) {
+          return -1;
+        }
+        BOOST_LOG(info) << "Using ScreenCast-only mode"sv;
       }
-      if (start_session(loop, session_path, pipewire_node, width, height) < 0) {
+
+      if (start_session(loop, session_path, pipewire_node, width, height, /*use_remote_desktop=*/!use_screencast_only) < 0) {
         return -1;
       }
       if (open_pipewire_remote(session_path, pipewire_fd) < 0) {
@@ -159,17 +265,17 @@ namespace portal {
       return 0;
     }
 
-    int pipewire_fd;
-    int pipewire_node;
-    int width;
-    int height;
+    int pipewire_fd = -1;
+    int pipewire_node = -1;
+    int width = 0;
+    int height = 0;
 
   private:
-    GDBusConnection *conn;
-    GDBusProxy *screencast_proxy;
-    GDBusProxy *remote_desktop_proxy;
+    GDBusConnection *conn = nullptr;
+    GDBusProxy *screencast_proxy = nullptr;
+    GDBusProxy *remote_desktop_proxy = nullptr;
 
-    int create_session(GMainLoop *loop, const gchar *session_path, const gchar *session_token) {
+    int create_session(GMainLoop *loop, const gchar *session_path, const gchar *session_token, bool use_remote_desktop) {
       dbus_response_t response = {
         0,
       };
@@ -185,8 +291,9 @@ namespace portal {
       g_variant_builder_close(&builder);
 
       g_autoptr(GError) err = NULL;
-      // Use ScreenCast.CreateSession for better portal compatibility (KDE portal doesn't support combined RemoteDesktop+ScreenCast sessions)
-      g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(screencast_proxy, "CreateSession", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
+      // Use RemoteDesktop.CreateSession for combined mode, ScreenCast.CreateSession for ScreenCast-only
+      GDBusProxy *proxy = use_remote_desktop ? remote_desktop_proxy : screencast_proxy;
+      g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(proxy, "CreateSession", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
 
       if (err) {
         BOOST_LOG(error) << "Could not create session: "sv << err->message;
@@ -260,7 +367,7 @@ namespace portal {
       return 0;
     }
 
-    int start_session(GMainLoop *loop, const gchar *session_path, int &pipewire_node, int &width, int &height) {
+    int start_session(GMainLoop *loop, const gchar *session_path, int &pipewire_node, int &width, int &height, bool use_remote_desktop) {
       dbus_response_t response = {
         0,
       };
@@ -277,8 +384,9 @@ namespace portal {
       g_variant_builder_close(&builder);
 
       g_autoptr(GError) err = NULL;
-      // Use ScreenCast.Start for ScreenCast-only sessions
-      g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(screencast_proxy, "Start", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
+      // Use RemoteDesktop.Start for combined mode, ScreenCast.Start for ScreenCast-only
+      GDBusProxy *proxy = use_remote_desktop ? remote_desktop_proxy : screencast_proxy;
+      g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(proxy, "Start", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
       if (err) {
         BOOST_LOG(error) << "Could not start session: "sv << err->message;
         return -1;
@@ -293,8 +401,11 @@ namespace portal {
       char *new_token = NULL;
       g_variant_lookup(dict, "restore_token", "s", &new_token, NULL);
       if (new_token) {
-        if (restore_token) g_free(restore_token);
-        restore_token = new_token;
+        {
+          std::lock_guard<std::mutex> lock(token_mutex);
+          if (restore_token) g_free(restore_token);
+          restore_token = new_token;
+        }
         save_restore_token();
       }
 
@@ -309,19 +420,21 @@ namespace portal {
     }
 
     int open_pipewire_remote(const gchar *session_path, int &fd) {
-      GUnixFDList *fd_list;
+      GUnixFDList *fd_list = nullptr;
       GVariant *msg = g_variant_new("(oa{sv})", session_path, NULL);
 
       g_autoptr(GError) err = NULL;
       g_autoptr(GVariant) reply = g_dbus_proxy_call_with_unix_fd_list_sync(screencast_proxy, "OpenPipeWireRemote", msg, G_DBUS_CALL_FLAGS_NONE, -1, NULL, &fd_list, NULL, &err);
       if (err) {
         BOOST_LOG(error) << "Could not open pipewire remote: "sv << err->message;
+        if (fd_list) g_object_unref(fd_list);
         return -1;
       }
 
       int fd_handle;
       g_variant_get(reply, "(h)", &fd_handle);
       fd = g_unix_fd_list_get(fd_list, fd_handle, NULL);
+      g_object_unref(fd_list);
       return 0;
     }
 
@@ -341,31 +454,31 @@ namespace portal {
     }
 
     static void create_request_path(GDBusConnection *conn, gchar **out_path, gchar **out_token) {
-      static uint32_t request_count = 0;
+      static std::atomic<uint32_t> request_count{0};
 
-      request_count++;
+      uint32_t count = ++request_count;
 
       if (out_token) {
-        *out_token = g_strdup_printf("Sunshine%u", request_count);
+        *out_token = g_strdup_printf("Sunshine%u", count);
       }
       if (out_path) {
         g_autofree gchar *sender = get_sender_string(conn);
-        *out_path = g_strdup_printf(REQUEST_PREFIX "%s/Sunshine%u", sender, request_count);
+        *out_path = g_strdup_printf(REQUEST_PREFIX "%s/Sunshine%u", sender, count);
       }
     }
 
     static void create_session_path(GDBusConnection *conn, gchar **out_path, gchar **out_token) {
-      static uint32_t session_count = 0;
+      static std::atomic<uint32_t> session_count{0};
 
-      session_count++;
+      uint32_t count = ++session_count;
 
       if (out_token) {
-        *out_token = g_strdup_printf("Sunshine%u", session_count);
+        *out_token = g_strdup_printf("Sunshine%u", count);
       }
 
       if (out_path) {
         g_autofree gchar *sender = get_sender_string(conn);
-        *out_path = g_strdup_printf(SESSION_PREFIX "%s/Sunshine%u", sender, session_count);
+        *out_path = g_strdup_printf(SESSION_PREFIX "%s/Sunshine%u", sender, count);
       }
     }
 

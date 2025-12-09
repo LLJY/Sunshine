@@ -613,12 +613,8 @@ namespace portal {
               img_descriptor->sd.pitches[i] = buf->datas[i].chunk->stride;
               img_descriptor->sd.offsets[i] = buf->datas[i].chunk->offset;
             }
-            // Update row_pitch to match actual buffer stride
-            img->row_pitch = buf->datas[0].chunk->stride;
           } else {
             img->data = (std::uint8_t *) buf->datas[0].data;
-            // Update row_pitch to match actual buffer stride
-            img->row_pitch = buf->datas[0].chunk->stride;
           }
         }
       }

@@ -781,6 +781,8 @@ namespace portal {
 
       width = dbus.width;
       height = dbus.height;
+      env_width = width;
+      env_height = height;
       framerate = config.framerate;
 
       pipewire.init(dbus.pipewire_fd, dbus.pipewire_node);

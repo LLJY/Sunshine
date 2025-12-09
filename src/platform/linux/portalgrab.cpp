@@ -172,6 +172,13 @@ namespace portal {
   class dbus_t {
   public:
     ~dbus_t() {
+      // Close the active session before destroying proxies
+      if (active_session_path) {
+        close_session(active_session_path);
+        g_free(active_session_path);
+        active_session_path = nullptr;
+      }
+
       // Cleanup token on dbus destruction
       cleanup_restore_token();
 
@@ -262,6 +269,9 @@ namespace portal {
         return -1;
       }
 
+      // Store the session path for cleanup in destructor
+      active_session_path = g_strdup(session_path);
+
       return 0;
     }
 
@@ -274,6 +284,7 @@ namespace portal {
     GDBusConnection *conn = nullptr;
     GDBusProxy *screencast_proxy = nullptr;
     GDBusProxy *remote_desktop_proxy = nullptr;
+    gchar *active_session_path = nullptr;  // Track active session for cleanup
 
     int create_session(GMainLoop *loop, const gchar *session_path, const gchar *session_token, bool use_remote_desktop) {
       dbus_response_t response = {
@@ -436,6 +447,28 @@ namespace portal {
       fd = g_unix_fd_list_get(fd_list, fd_handle, NULL);
       g_object_unref(fd_list);
       return 0;
+    }
+
+    void close_session(const gchar *session_path) {
+      if (!session_path || !conn) return;
+
+      g_autoptr(GError) err = NULL;
+      g_dbus_connection_call_sync(
+        conn,
+        PORTAL_NAME,
+        session_path,
+        "org.freedesktop.portal.Session",
+        "Close",
+        NULL,
+        NULL,
+        G_DBUS_CALL_FLAGS_NONE,
+        -1,
+        NULL,
+        &err);
+
+      if (err) {
+        BOOST_LOG(debug) << "Failed to close session (may already be closed): "sv << err->message;
+      }
     }
 
     static void on_response_received_cb(GDBusConnection *connection, const gchar *sender_name, const gchar *object_path, const gchar *interface_name, const gchar *signal_name, GVariant *parameters, gpointer user_data) {

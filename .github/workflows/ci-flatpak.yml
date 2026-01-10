@@ -33,7 +33,7 @@ jobs:
     steps:
       - name: More space
         if: matrix.arch == 'x86_64'
-        uses: LizardByte/actions/actions/more_space@v2025.1028.23217
+        uses: LizardByte/actions/actions/more_space@c2e99809a28d738261f986b884cad52fe3a91d5b  # v2025.1227.191137
         with:
           analyze-space-savings: true
           clean-all: true
@@ -91,7 +91,7 @@ jobs:
         run: cat generated-sources.json
 
       - name: Cache Flatpak build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ./build/.flatpak-builder
           key: flatpak-${{ matrix.arch }}-${{ github.sha }}
@@ -206,7 +206,7 @@ jobs:
           tar -czf ./artifacts/flathub.tar.gz -C ./flathub .
 
       - name: Upload Artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: build-Linux-Flatpak-${{ matrix.arch }}
           path: artifacts/
